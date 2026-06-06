@@ -12,12 +12,16 @@ app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP], suppress_
 server = app.server
 processor = MaterialDataProcessor()
 
+REQUIRED_COLUMNS = ['日期', '材料名称', '规格', '计划用量', '单位', '单价']
+
 default_df = processor.load_data()
-simulated_df = processor.run_simulation(default_df)
+default_simulated = processor.run_simulation(default_df)
 
 app.layout = html.Div([
-    dcc.Store(id='stored-data', data=simulated_df.to_dict('records')),
+    dcc.Store(id='stored-data', data=default_simulated.to_dict('records')),
     dcc.Store(id='original-data', data=default_df.to_dict('records')),
+    dcc.Store(id='baseline-data', data=default_simulated.to_dict('records')),
+    dcc.Store(id='current-simulated-data', data=default_simulated.to_dict('records')),
     dcc.Location(id='url', refresh=False),
     dbc.NavbarSimple(
         children=[
@@ -99,6 +103,10 @@ def serve_clerk():
                 ),
                 html.Div(id='upload-status', className='mt-2'),
                 dbc.Button('加载示例数据', id='load-sample-btn', color='secondary', className='mt-2 mb-4'),
+                html.Div([
+                    html.H6("必填字段说明："),
+                    html.Small("日期, 材料名称, 规格, 计划用量, 单位, 单价", className="text-muted")
+                ])
             ], width=12)
         ]),
         dbc.Row([
@@ -154,10 +162,16 @@ def serve_supervisor():
                         dbc.Row([
                             dbc.Col([
                                 html.Label("选择材料"),
-                                dcc.Dropdown(id='material-dropdown', multi=False, value='钢筋')
+                                dcc.Dropdown(id='material-dropdown', multi=False)
                             ], md=12),
                         ], className='mt-3'),
-                        dbc.Button('运行模拟', id='run-simulation-btn', color='primary', className='mt-3')
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Button('设为基准', id='set-baseline-btn', color='secondary', className='mt-3 me-2'),
+                                dbc.Button('运行模拟', id='run-simulation-btn', color='primary', className='mt-3'),
+                            ]),
+                        ]),
+                        html.Div(id='baseline-info', className='mt-2 text-muted small')
                     ])
                 ])
             ], width=12)
@@ -165,7 +179,7 @@ def serve_supervisor():
         dbc.Row([
             dbc.Col([
                 dbc.Card([
-                    dbc.CardHeader("用量趋势图（计划 vs 实际 vs 移动平均）"),
+                    dbc.CardHeader("用量趋势对比（基准 vs 当前）"),
                     dbc.CardBody([
                         dcc.Graph(id='trend-chart')
                     ])
@@ -175,7 +189,7 @@ def serve_supervisor():
         dbc.Row([
             dbc.Col([
                 dbc.Card([
-                    dbc.CardHeader("损耗率趋势"),
+                    dbc.CardHeader("损耗率趋势对比"),
                     dbc.CardBody([
                         dcc.Graph(id='loss-chart')
                     ])
@@ -193,7 +207,7 @@ def serve_supervisor():
         dbc.Row([
             dbc.Col([
                 dbc.Card([
-                    dbc.CardHeader("模拟结果汇总"),
+                    dbc.CardHeader("模拟结果对比汇总"),
                     dbc.CardBody([
                         html.Div(id='simulation-summary')
                     ])
@@ -208,7 +222,8 @@ def serve_cost():
         dbc.Row([
             dbc.Col([
                 html.H4("成本人员工作台 - 报告导出"),
-                html.Hr()
+                html.Hr(),
+                html.Div(id='cost-sync-info', className='text-info small mb-2')
             ], width=12)
         ]),
         dbc.Row([
@@ -284,6 +299,20 @@ def update_slider_values(loss_rate, safety_stock, replenish, ma):
     )
 
 
+def validate_dataframe(df):
+    missing_cols = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+    if missing_cols:
+        return False, f"缺少必填字段: {', '.join(missing_cols)}。请确保包含字段: {', '.join(REQUIRED_COLUMNS)}"
+    
+    if len(df) == 0:
+        return False, "上传的数据为空，请检查文件内容"
+    
+    if '材料名称' not in df.columns or df['材料名称'].nunique() == 0:
+        return False, "未找到任何材料数据，请检查'材料名称'列"
+    
+    return True, None
+
+
 def parse_contents(contents, filename):
     content_type, content_string = contents.split(',')
     decoded = base64.b64decode(content_string)
@@ -327,13 +356,88 @@ def update_data(contents, n_clicks, filename):
             default_df = processor.load_data()
             simulated = processor.run_simulation(default_df)
             return simulated.to_dict('records'), default_df.to_dict('records'), dbc.Alert(error, color="danger")
-        processor.save_uploaded_data(df)
-        simulated = processor.run_simulation(df)
-        return simulated.to_dict('records'), df.to_dict('records'), dbc.Alert(f"成功上传文件: {filename}", color="success")
+        
+        valid, validation_error = validate_dataframe(df)
+        if not valid:
+            default_df = processor.load_data()
+            simulated = processor.run_simulation(default_df)
+            return simulated.to_dict('records'), default_df.to_dict('records'), dbc.Alert(validation_error, color="danger")
+        
+        try:
+            processor.save_uploaded_data(df)
+            simulated = processor.run_simulation(df)
+            return simulated.to_dict('records'), df.to_dict('records'), dbc.Alert(f"成功上传文件: {filename}，共 {len(df)} 条数据，{df['材料名称'].nunique()} 种材料", color="success")
+        except Exception as e:
+            default_df = processor.load_data()
+            simulated = processor.run_simulation(default_df)
+            return simulated.to_dict('records'), default_df.to_dict('records'), dbc.Alert(f"数据处理失败: {str(e)}", color="danger")
     
     default_df = processor.load_data()
     simulated = processor.run_simulation(default_df)
     return simulated.to_dict('records'), default_df.to_dict('records'), ""
+
+
+@app.callback(
+    Output('baseline-data', 'data'),
+    [Input('stored-data', 'data'),
+     Input('set-baseline-btn', 'n_clicks')],
+    [State('current-simulated-data', 'data')]
+)
+def update_baseline(stored_data, set_baseline_clicks, current_data):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return stored_data
+    
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    if trigger_id == 'stored-data':
+        return stored_data
+    
+    if trigger_id == 'set-baseline-btn' and set_baseline_clicks is not None:
+        if current_data:
+            return current_data
+    
+    return dash.no_update
+
+
+@app.callback(
+    Output('current-simulated-data', 'data'),
+    [Input('stored-data', 'data'),
+     Input('run-simulation-btn', 'n_clicks')],
+    [State('loss-rate-slider', 'value'),
+     State('safety-stock-slider', 'value'),
+     State('replenish-slider', 'value'),
+     State('ma-slider', 'value'),
+     State('original-data', 'data')]
+)
+def update_current_simulated(stored_data, run_clicks, loss_rate, safety_stock, replenish_interval, ma_window, original_data):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return stored_data
+    
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    if trigger_id == 'stored-data':
+        return stored_data
+    
+    if trigger_id == 'run-simulation-btn' and run_clicks is not None:
+        if not original_data:
+            return dash.no_update
+        
+        df = pd.DataFrame(original_data)
+        loss_rate_decimal = loss_rate / 100.0
+        
+        simulated = processor.run_simulation(
+            df,
+            loss_rate=loss_rate_decimal,
+            ma_window=ma_window,
+            safety_stock=safety_stock,
+            replenish_interval=replenish_interval
+        )
+        
+        return simulated.to_dict('records')
+    
+    return dash.no_update
 
 
 @app.callback(
@@ -355,15 +459,32 @@ def update_preview(data):
 
 
 @app.callback(
-    Output('material-dropdown', 'options'),
-    [Input('stored-data', 'data')]
+    [Output('material-dropdown', 'options'),
+     Output('material-dropdown', 'value')],
+    [Input('current-simulated-data', 'data')]
 )
 def update_material_dropdown(data):
     if not data:
-        return []
+        return [], None
     df = pd.DataFrame(data)
+    if '材料名称' not in df.columns:
+        return [], None
     materials = df['材料名称'].unique()
-    return [{'label': m, 'value': m} for m in materials]
+    if len(materials) == 0:
+        return [], None
+    options = [{'label': m, 'value': m} for m in materials]
+    return options, materials[0]
+
+
+@app.callback(
+    Output('baseline-info', 'children'),
+    [Input('baseline-data', 'data')]
+)
+def update_baseline_info(data):
+    if not data:
+        return ""
+    df = pd.DataFrame(data)
+    return f"当前基准数据: {len(df)} 条记录，损耗率约 {df['损耗率%'].mean():.2f}%"
 
 
 @app.callback(
@@ -371,41 +492,43 @@ def update_material_dropdown(data):
      Output('loss-chart', 'figure'),
      Output('replenish-chart', 'figure'),
      Output('simulation-summary', 'children')],
-    [Input('run-simulation-btn', 'n_clicks'),
-     Input('material-dropdown', 'value')],
+    [Input('current-simulated-data', 'data'),
+     Input('material-dropdown', 'value'),
+     Input('baseline-data', 'data')],
     [State('loss-rate-slider', 'value'),
-     State('safety-stock-slider', 'value'),
-     State('replenish-slider', 'value'),
-     State('ma-slider', 'value'),
-     State('original-data', 'data')]
+     State('ma-slider', 'value')]
 )
-def update_charts(n_clicks, material, loss_rate, safety_stock, replenish_interval, ma_window, original_data):
-    if not original_data or not material:
+def update_charts(current_data, material, baseline_data, loss_rate, ma_window):
+    if not current_data or not material or not baseline_data:
         return {}, {}, {}, html.Div("请选择材料")
     
-    df = pd.DataFrame(original_data)
-    loss_rate_decimal = loss_rate / 100.0
-    
-    simulated = processor.run_simulation(
-        df,
-        loss_rate=loss_rate_decimal,
-        ma_window=ma_window,
-        safety_stock=safety_stock,
-        replenish_interval=replenish_interval
-    )
+    simulated = pd.DataFrame(current_data)
+    baseline_df = pd.DataFrame(baseline_data)
     
     mat_data = simulated[simulated['材料名称'] == material].sort_values('日期')
+    baseline_mat = baseline_df[baseline_df['材料名称'] == material].sort_values('日期')
+    
+    if len(mat_data) == 0:
+        return {}, {}, {}, html.Div("未找到该材料的数据")
     
     trend_fig = go.Figure()
+    
+    if len(baseline_mat) > 0:
+        trend_fig.add_trace(go.Scatter(x=baseline_mat['日期'], y=baseline_mat['实际用量'], mode='lines', name='基准-实际用量', line=dict(color='#9467bd', width=2, dash='dot'), opacity=0.7))
+    
     trend_fig.add_trace(go.Scatter(x=mat_data['日期'], y=mat_data['计划用量'], mode='lines+markers', name='计划用量', line=dict(color='#1f77b4', width=2)))
-    trend_fig.add_trace(go.Scatter(x=mat_data['日期'], y=mat_data['实际用量'], mode='lines+markers', name='实际用量', line=dict(color='#ff7f0e', width=2)))
+    trend_fig.add_trace(go.Scatter(x=mat_data['日期'], y=mat_data['实际用量'], mode='lines+markers', name='当前-实际用量', line=dict(color='#ff7f0e', width=2)))
     trend_fig.add_trace(go.Scatter(x=mat_data['日期'], y=mat_data['移动平均'], mode='lines', name=f'{ma_window}天移动平均', line=dict(color='#2ca02c', width=3, dash='dash')))
-    trend_fig.update_layout(title=f'{material} - 用量趋势分析', xaxis_title='日期', yaxis_title='用量', legend=dict(orientation='h', y=-0.2), height=450, hovermode='x unified')
+    trend_fig.update_layout(title=f'{material} - 用量趋势对比分析', xaxis_title='日期', yaxis_title='用量', legend=dict(orientation='h', y=-0.2), height=450, hovermode='x unified')
     
     loss_fig = go.Figure()
-    loss_fig.add_trace(go.Bar(x=mat_data['日期'], y=mat_data['损耗率%'], name='损耗率%', marker_color='#d62728'))
+    
+    if len(baseline_mat) > 0:
+        loss_fig.add_trace(go.Bar(x=baseline_mat['日期'], y=baseline_mat['损耗率%'], name='基准-损耗率%', marker_color='#9467bd', opacity=0.5))
+    
+    loss_fig.add_trace(go.Bar(x=mat_data['日期'], y=mat_data['损耗率%'], name='当前-损耗率%', marker_color='#d62728'))
     loss_fig.add_hline(y=loss_rate, line_dash="dash", line_color="red", annotation_text=f"目标损耗率: {loss_rate}%")
-    loss_fig.update_layout(title=f'{material} - 损耗率趋势', xaxis_title='日期', yaxis_title='损耗率 (%)', height=350)
+    loss_fig.update_layout(title=f'{material} - 损耗率趋势对比', xaxis_title='日期', yaxis_title='损耗率 (%)', height=350, barmode='group')
     
     replenish_fig = go.Figure()
     replenish_fig.add_trace(go.Scatter(x=mat_data['日期'], y=mat_data['累计用量'], mode='lines', name='累计用量', fill='tozeroy', line=dict(color='#9467bd')))
@@ -415,15 +538,60 @@ def update_charts(n_clicks, material, loss_rate, safety_stock, replenish_interva
     replenish_fig.update_layout(title=f'{material} - 累计用量与补货建议', xaxis_title='日期', yaxis_title='累计用量', height=350)
     
     summary = processor.get_material_summary(simulated)
+    baseline_summary = processor.get_material_summary(baseline_df)
+    
     mat_summary = summary[summary['材料名称'] == material].iloc[0]
     
+    if len(baseline_summary[baseline_summary['材料名称'] == material]) > 0:
+        baseline_mat_summary = baseline_summary[baseline_summary['材料名称'] == material].iloc[0]
+        
+        cost_diff = mat_summary['总实际成本'] - baseline_mat_summary['总实际成本']
+        cost_diff_text = f"{'+' if cost_diff > 0 else ''}{cost_diff:,.0f}"
+        cost_diff_color = "text-danger" if cost_diff > 0 else "text-success"
+        
+        loss_diff = mat_summary['平均损耗率%'] - baseline_mat_summary['平均损耗率%']
+        loss_diff_text = f"{'+' if loss_diff > 0 else ''}{loss_diff:.2f}%"
+        
+        baseline_actual = baseline_mat_summary['实际总量']
+        baseline_loss = baseline_mat_summary['总损耗']
+        baseline_cost = baseline_mat_summary['总实际成本']
+    else:
+        cost_diff_text = "N/A"
+        cost_diff_color = "text-muted"
+        loss_diff_text = "N/A"
+        baseline_actual = "N/A"
+        baseline_loss = "N/A"
+        baseline_cost = "N/A"
+    
     summary_cards = dbc.Row([
-        dbc.Col(dbc.Card(dbc.CardBody([html.H5("计划总量", className="card-title"), html.H3(f"{mat_summary['计划总量']} {mat_summary['单位']}", className="text-primary")])), md=2),
-        dbc.Col(dbc.Card(dbc.CardBody([html.H5("实际总量", className="card-title"), html.H3(f"{mat_summary['实际总量']} {mat_summary['单位']}", className="text-warning")])), md=2),
-        dbc.Col(dbc.Card(dbc.CardBody([html.H5("总损耗", className="card-title"), html.H3(f"{mat_summary['总损耗']} {mat_summary['单位']}", className="text-danger")])), md=2),
-        dbc.Col(dbc.Card(dbc.CardBody([html.H5("平均损耗率", className="card-title"), html.H3(f"{mat_summary['平均损耗率%']}%", className="text-info")])), md=2),
-        dbc.Col(dbc.Card(dbc.CardBody([html.H5("总计划成本", className="card-title"), html.H3(f"¥{mat_summary['总计划成本']:,.0f}", className="text-success")])), md=2),
-        dbc.Col(dbc.Card(dbc.CardBody([html.H5("成本差异", className="card-title"), html.H3(f"¥{mat_summary['成本差异']:,.0f}", className="text-danger" if mat_summary['成本差异'] > 0 else "text-success")])), md=2),
+        dbc.Col(dbc.Card(dbc.CardBody([
+            html.H5("计划总量", className="card-title"),
+            html.H3(f"{mat_summary['计划总量']} {mat_summary['单位']}", className="text-primary")
+        ])), md=2),
+        dbc.Col(dbc.Card(dbc.CardBody([
+            html.H5("实际总量", className="card-title"),
+            html.H3(f"{mat_summary['实际总量']} {mat_summary['单位']}", className="text-warning"),
+            html.Small(f"基准: {baseline_actual}", className="text-muted")
+        ])), md=2),
+        dbc.Col(dbc.Card(dbc.CardBody([
+            html.H5("总损耗", className="card-title"),
+            html.H3(f"{mat_summary['总损耗']} {mat_summary['单位']}", className="text-danger"),
+            html.Small(f"基准: {baseline_loss}", className="text-muted")
+        ])), md=2),
+        dbc.Col(dbc.Card(dbc.CardBody([
+            html.H5("平均损耗率", className="card-title"),
+            html.H3(f"{mat_summary['平均损耗率%']}%", className="text-info"),
+            html.Small(f"{loss_diff_text} 较基准", className=cost_diff_color)
+        ])), md=2),
+        dbc.Col(dbc.Card(dbc.CardBody([
+            html.H5("总实际成本", className="card-title"),
+            html.H3(f"¥{mat_summary['总实际成本']:,.0f}", className="text-warning"),
+            html.Small(f"基准: ¥{baseline_cost:,.0f}" if isinstance(baseline_cost, (int, float)) else f"基准: {baseline_cost}", className="text-muted")
+        ])), md=2),
+        dbc.Col(dbc.Card(dbc.CardBody([
+            html.H5("成本差异(较基准)", className="card-title"),
+            html.H3(f"¥{cost_diff_text}", className=cost_diff_color)
+        ])), md=2),
     ])
     
     return trend_fig, loss_fig, replenish_fig, summary_cards
@@ -431,15 +599,18 @@ def update_charts(n_clicks, material, loss_rate, safety_stock, replenish_interva
 
 @app.callback(
     [Output('cost-summary-table', 'children'),
-     Output('cost-chart', 'figure')],
-    [Input('stored-data', 'data')]
+     Output('cost-chart', 'figure'),
+     Output('cost-sync-info', 'children')],
+    [Input('current-simulated-data', 'data')]
 )
 def update_cost_page(data):
     if not data:
-        return html.Div("暂无数据"), {}
+        return html.Div("暂无数据"), {}, ""
     
     df = pd.DataFrame(data)
     summary = processor.get_material_summary(df)
+    
+    info_text = f"当前数据包含 {len(df)} 条记录，{df['材料名称'].nunique()} 种材料 - 已同步项目主管的模拟参数"
     
     table = dash_table.DataTable(
         data=summary.to_dict('records'),
@@ -469,13 +640,13 @@ def update_cost_page(data):
     cost_fig.add_trace(go.Bar(x=summary['材料名称'], y=summary['总实际成本'], name='实际成本', marker_color='#ff7f0e'))
     cost_fig.update_layout(title='材料成本对比分析', barmode='group', xaxis_title='材料名称', yaxis_title='金额 (¥)', height=400, legend=dict(orientation='h', y=-0.2))
     
-    return table, cost_fig
+    return table, cost_fig, info_text
 
 
 @app.callback(
     Output('download-excel', 'data'),
     [Input('export-excel-btn', 'n_clicks')],
-    [State('stored-data', 'data')],
+    [State('current-simulated-data', 'data')],
     prevent_initial_call=True
 )
 def export_excel(n_clicks, data):
@@ -489,7 +660,7 @@ def export_excel(n_clicks, data):
 @app.callback(
     Output('download-csv', 'data'),
     [Input('export-csv-btn', 'n_clicks')],
-    [State('stored-data', 'data')],
+    [State('current-simulated-data', 'data')],
     prevent_initial_call=True
 )
 def export_csv(n_clicks, data):
@@ -501,4 +672,4 @@ def export_csv(n_clicks, data):
 
 
 if __name__ == '__main__':
-    app.run(debug=True, port=8050)
+    app.run(debug=False, port=8051)
